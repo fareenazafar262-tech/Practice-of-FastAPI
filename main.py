@@ -1,6 +1,12 @@
-from fastapi import FastAPI,HTTPException,File, UploadFile
-from pydantic import BaseModel
+from fastapi import FastAPI,HTTPException,File, UploadFile,Depends
+from pydantic import BaseModel,EmailStr
+from passlib.context import CryptContext
+from jose import jwt,JWTError
+from datetime import datetime,timedelta,timezone
+from fastapi.security import OAuth2PasswordBearer,OAuth2PasswordRequestForm
 import mysql.connector
+from mysql.connector import IntegrityError
+
 app = FastAPI ()
 
 @app.get("/users")
@@ -256,7 +262,7 @@ def get_cars(id:int):
             detail={"message":f"no {id} found!"}
         )
     return{"id": row[0], "model": row[1], "color": row[2], "price": row[3]}
-@app.post("/Url",status_code=201)
+@app.put("/Url",status_code=201)
 def update_car(id:int,car:Car):
     query="UPDATE car SET model=%s,coor-%s,price=%s WHERE id=%s"
     values=(car.model,car.color,car.price,(id,))
@@ -310,4 +316,123 @@ def add_todo(title: str):
 def get_todos():
     # We just return whatever is currently in the list
     return todos
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+class Signup(BaseModel):
+    name:str
+    password:str
+    email:EmailStr
+    address:str
+    phone:str
+class UserRegister(BaseModel):
+     name:str
+     address:str
+     phone:str
+class Refresh_token(BaseModel):
+    refresh_token:str
+
+SECRET_KEY="MY SELF KOHSAR"
+ALGORITHM="HS256"
+EXPIRE_MINUTES=30
+EXPIRE_DAYS=7
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def create_token_access(data:dict): 
+    to_encode=data.copy()
+    expire=datetime.now(timezone.utc)+ timedelta(EXPIRE_MINUTES)
+    to_encode.update({"exp":expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def refresh_tokens(data:dict):
+    to_encode=data.copy()
+    expire=datetime.now(timezone.utc)+ timedelta(EXPIRE_DAYS)
+    to_encode.update({"exp":expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def raise_error(status_code: int, message: str):
+    raise HTTPException(status_code=status_code, detail=message)
+
+def get_db():
+    connection = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="Fareena@626",  
+        database="e_commerce"
+    )
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
+    try:
+        decoded_data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = decoded_data["sub"]
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM token_blacklist WHERE token = %s", (token,))
+    blacklisted = cursor.fetchone()
+
+    if blacklisted is not None:
+        raise HTTPException(status_code=401, detail="Token has been logged out")
+
+    return username
+# ---- SIGNUP route ----
+@app.post("/signup")
+def signup(user: UserRegister, db = Depends(get_db)):
+    hashed_password = pwd_context.hash(user.password)
+    cursor = db.cursor()
+
+    try:
+        cursor.execute(
+            "INSERT INTO users (username, password, email, address, phone_number) VALUES (%s, %s, %s, %s, %s)",
+            (user.username, hashed_password, user.email, user.address, user.phone_number)
+        )
+        db.commit()
+    except IntegrityError:
+        raise_error(401,"User does not exist")
+    return {"message": "Successfully registered", "username": user.username}
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(),db=Depends(get_db)):
+    cursor=cursor.db(dictionary=True)
+    cursor.execute("SELECT * FROM user WHERE username=%s",(form_data.username))
+    user=user.fetchone()
+    if user is None:
+        raise_error(401,"User does not exist")
+    if not pwd_context.verify(form_data.password,user["password"]):
+        raise_error(401,"Incorrect Password")
+        token = create_token_access(data={"sub": user["username"]})
+    refresh_token = refresh_token(data={"sub": user["username"]})
+
+    return {
+        "access_token": token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+
+# ---- REFRESH route ----
+@app.post("/refresh")
+def refresh_access_token(data: Refresh_token):
+    try:
+        decoded_data = jwt.decode(data.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = decoded_data["sub"]
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    new_access_token = create_token_access(data={"sub": username})
+    return {"access_token": new_access_token, "token_type": "bearer"}
+
+
+# ---- LOGOUT route ----
+@app.post("/logout")
+def logout(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("INSERT INTO token_blacklist (token) VALUES (%s)", (token,))
+    db.commit()
+    return {"message": "Logged out successfully"}
